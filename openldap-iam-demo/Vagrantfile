@@ -1,0 +1,77 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+#
+# Directory-State-Aware Automated Remediation — Lab Topology
+# (Windows-host-friendly variant: everything Linux-based lives inside
+# VirtualBox VMs, so the Windows host only needs VirtualBox + Vagrant.)
+#
+#   ldap1 (192.168.56.11)  \
+#   ldap2 (192.168.56.12)   >  3-node OpenLDAP mirror-mode (N-way multi-master) cluster
+#   ldap3 (192.168.56.13)  /
+#   ctrl  (192.168.56.10)  -- runs the remediation controller + HAProxy front-end
+#
+# Requires: VirtualBox + Vagrant on Windows. Bring the whole lab up with
+# `vagrant up` from a Command Prompt / PowerShell / Git Bash window.
+#
+# NOTE on SSH trust for automated remediation: ctrl generates an SSH
+# keypair and publishes the public half to /vagrant/ctrl_pubkey.pub (via
+# the shared synced folder). Each LDAP node's trust_controller.sh then
+# adds that key to its own authorized_keys. Because ldap1/2/3 provision
+# BEFORE ctrl on a first-time `vagrant up`, that first pass will find no
+# key yet (harmless — it just prints a note). After `vagrant up` finishes,
+# run this once to complete the trust setup:
+#
+#   vagrant provision ldap1 ldap2 ldap3
+#
+# (Only needed once per fresh environment — not needed on every `vagrant up`.)
+
+NODES = {
+  "ldap1" => { ip: "192.168.56.11", server_id: 1 },
+  "ldap2" => { ip: "192.168.56.12", server_id: 2 },
+  "ldap3" => { ip: "192.168.56.13", server_id: 3 },
+}
+
+CONTROLLER_IP = "192.168.56.10"
+
+Vagrant.configure("2") do |config|
+  config.vm.box = "ubuntu/jammy64"
+
+  NODES.each do |name, opts|
+    config.vm.define name do |node|
+      node.vm.hostname = name
+      node.vm.network "private_network", ip: opts[:ip]
+
+      node.vm.provider "virtualbox" do |vb|
+        vb.name = name
+        vb.memory = 512
+        vb.cpus = 1
+      end
+
+      node.vm.provision "shell", path: "provisioning/common.sh"
+      node.vm.provision "shell",
+        path: "provisioning/configure_node.sh",
+        args: [opts[:server_id].to_s, opts[:ip], NODES.values.map { |o| o[:ip] }.join(",")]
+      # Picks up the controller's public key once ctrl has generated it.
+      # run: "always" so re-running `vagrant provision` retries this even
+      # if it found nothing on an earlier pass.
+      node.vm.provision "shell", path: "provisioning/trust_controller.sh", run: "always"
+    end
+  end
+
+  config.vm.define "ctrl" do |ctrl|
+    ctrl.vm.hostname = "ctrl"
+    ctrl.vm.network "private_network", ip: CONTROLLER_IP
+
+    ctrl.vm.provider "virtualbox" do |vb|
+      vb.name = "ctrl"
+      vb.memory = 512
+      vb.cpus = 1
+    end
+
+    ctrl.vm.provision "shell", path: "provisioning/controller_host.sh",
+      args: [NODES.values.map { |o| o[:ip] }.join(",")]
+
+    ctrl.vm.synced_folder "controller", "/opt/remediation-controller"
+    ctrl.vm.synced_folder "scenarios", "/opt/scenarios"
+  end
+end
